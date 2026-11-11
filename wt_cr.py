@@ -5,10 +5,12 @@ import re
 import time
 import json
 import uuid
-from decimal import Decimal, ROUND_FLOOR
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from collections import deque
 
 TIMEFRAME_MINUTES = 15
+STRIKE_INTERVAL = 50  # CRUDEOILM option strike spacing.
+EXPIRY_ROLLOVER_DAYS = 2  # Switch to next month with this many calendar days left.
 CHANNEL_LENGTH = 10
 AVERAGE_LENGTH = 21
 SIGNAL_LENGTH = 4
@@ -35,21 +37,22 @@ def notify(api, message, category="error"):
 
 
 def trade_notice(api, trade, event, details=''):
-    """Remember sent events so minute polls do not repeat them during this run."""
-    message = (
-        f"{event} | {trade['option']['symbol']} | qty={trade['quantity']}"
-        f" | buy ID={trade.get('order_id') or trade.get('buy_tag') or 'unconfirmed'}"
-    )
-    if details:
-        message += f' | {details}'
+    """Send only entry, confirmed exit and SL-hit messages, once per trade event."""
+    if event not in ('BUY submitted', 'EXIT filled', 'SL filled'):
+        return
+    side = 'Call' if trade['signal'] == 'LONG' else 'Put'
+    strike = f"{float(trade['option']['strike']):g}"
+    if event == 'BUY submitted':
+        ball = '🟢' if side == 'Call' else '🔴'
+        message = f'{ball} | Entered {side} | Strike {strike}'
+    elif event == 'EXIT filled':
+        message = f'❌ | Exit {side} | Strike {strike}'
+    else:
+        message = f'⚠️ | SL Hit | {side} | Strike {strike}'
     notices = trade.setdefault('notifications', {})
     if notices.get(event) == message:
         return
-    trade_events = ('BUY submitted', 'BUY filled', 'SL submitted', 'SL filled',
-                    'EXIT submitted', 'EXIT filled', 'Position closed',
-                    'Order recovered', 'SL terminal')
-    category = 'trade' if event in trade_events else 'error'
-    if notify(api, message, category=category):
+    if notify(api, message, category='trade'):
         notices[event] = message
         save_state(trade)
 
@@ -218,8 +221,8 @@ def wt_cross(candles, timeframe=None):
         return None
 
 
-def find_itm_option(api, signal, price):
-    """LONG buys an ITM call; SHORT buys an ITM put."""
+def find_atm_option(api, signal, price):
+    """LONG buys the nearest ATM call; SHORT buys the nearest ATM put."""
     try:
         price = float(price)
         if signal not in ('LONG', 'SHORT') or not math.isfinite(price) or price <= 0:
@@ -256,10 +259,10 @@ def find_itm_option(api, signal, price):
             print('No CRUDEOILM options found')
             return None
 
-        # Use the nearest expiry, or next month if fewer than 3 days remain.
+        # Use next month's expiry when 2 calendar days or fewer remain.
         expiries = sorted({option['expiry'] for option in options})
         expiry = expiries[0]
-        if (expiry - today).days < 3:
+        if (expiry - today).days <= EXPIRY_ROLLOVER_DAYS:
             next_month = (expiry.replace(day=28) + timedelta(days=4)).replace(day=1)
             expiry = None
             for date in expiries:
@@ -270,44 +273,51 @@ def find_itm_option(api, signal, price):
                 print('Next-month options unavailable')
                 return None
 
-        # Pick the closest strike below price for calls, above price for puts.
-        nearest = None
-        for option in options:
-            if option['expiry'] != expiry:
-                continue
-            if signal == 'LONG':
-                if option['kind'] != 'C' or option['strike'] >= price:
-                    continue
-            else:
-                if option['kind'] != 'P' or option['strike'] <= price:
-                    continue
-
-            if nearest is None or abs(option['strike'] - price) < abs(nearest['strike'] - price):
-                nearest = option
-
-        if nearest is None:
-            print('No matching ITM option found')
+        # A broad search can omit nearby strikes. Search the exact ATM symbol
+        # instead of choosing a distant contract from an incomplete result list.
+        step = Decimal(str(STRIKE_INTERVAL))
+        if not step.is_finite() or step <= 0:
+            raise ValueError('Strike interval must be positive')
+        strike = (Decimal(str(price)) / step).to_integral_value(rounding=ROUND_HALF_UP) * step
+        if strike <= 0:
+            raise ValueError('Invalid ATM strike')
+        kind = 'C' if signal == 'LONG' else 'P'
+        symbol = f"CRUDEOILM{expiry.strftime('%d%b%y').upper()}{kind}{strike.normalize():f}"
+        response = api.searchscrip(exchange='MCX', searchtext=symbol)
+        if not response or response.get('stat') != 'Ok':
+            print(f'ATM option unavailable: {symbol} | futures price={price}')
             return None
+        matches = {str(row['token']) for row in response.get('values', [])
+                   if row.get('tsym') == symbol and row.get('token')
+                   and row.get('exch', 'MCX') == 'MCX'}
+        if len(matches) != 1:
+            print(f'Exact ATM option not uniquely found: {symbol} | futures price={price}')
+            return None
+        token = matches.pop()
 
-        info = api.get_security_info(exchange='MCX', token=nearest['token'])
+        info = api.get_security_info(exchange='MCX', token=token)
         if not info or info.get('stat') != 'Ok':
             print('Option details unavailable')
             return None
         lot_size = int(info['ls'])
-        if info.get('tsym') != nearest['symbol'] or lot_size <= 0:
+        if (info.get('tsym') != symbol or lot_size <= 0
+                or info.get('exch', 'MCX') != 'MCX'
+                or str(info.get('token', token)) != token):
             print('Option symbol or lot size mismatch')
             return None
 
+        print(f'ATM selected: futures price={price} | strike={strike} | {symbol}', flush=True)
         return {
             'exchange': 'MCX',
-            'symbol': nearest['symbol'],
-            'token': nearest['token'],
-            'strike': nearest['strike'],
+            'symbol': symbol,
+            'token': token,
+            'strike': float(strike),
+            'underlying_price': price,
             'expiry': expiry.isoformat(),
             'lot_size': lot_size,
         }
     except Exception as error:
-        print('ITM option lookup failed:', type(error).__name__)
+        print('ATM option lookup failed:', type(error).__name__)
         return None
 
 
@@ -333,9 +343,9 @@ def take_trade(api, alert, price, lots=None, sl_points=None):
     if not alert_time or alert_time == last_trade_alert:
         return None
 
-    option = find_itm_option(api, alert['signal'], price)
+    option = find_atm_option(api, alert['signal'], price)
     if not option:
-        notify(api, 'WT CRUDE entry skipped: ITM option lookup failed')
+        notify(api, 'WT CRUDE entry skipped: exact ATM option lookup failed')
         return None
 
     quantity = lots * option['lot_size']
@@ -381,7 +391,7 @@ def take_trade(api, alert, price, lots=None, sl_points=None):
     trade['status'] = 'SUBMITTED'
     save_state(trade)
     print(f"BUY submitted: {option['symbol']} | qty={quantity} | ID={trade['order_id']}")
-    trade_notice(api, trade, 'BUY submitted', 'Awaiting fill')
+    trade_notice(api, trade, 'BUY submitted', f"Awaiting fill | futures price={price} | ATM strike={option['strike']}")
     apply_sl(api, trade)
     return trade
 
@@ -698,7 +708,7 @@ def find_futures(api):
     if not expiries:
         raise ValueError('No option expiry found')
     expiry = min(expiries)
-    if (expiry - today).days < 3:
+    if (expiry - today).days <= EXPIRY_ROLLOVER_DAYS:
         next_month = (expiry.replace(day=28) + timedelta(days=4)).replace(day=1)
         later = sorted(d for d in expiries if d.year == next_month.year and d.month == next_month.month)
         if not later:
@@ -708,6 +718,21 @@ def find_futures(api):
         if future['expiry'].year == expiry.year and future['expiry'].month == expiry.month:
             return future
     raise ValueError('Matching CRUDEOILM futures unavailable')
+
+
+def get_futures_price(api, future):
+    """Use the quote for the selected mini futures contract, not option premium."""
+    quote = api.get_quotes(exchange='MCX', token=future['token'])
+    if not quote or quote.get('stat') != 'Ok':
+        raise ValueError('Futures quote unavailable')
+    if (quote.get('tsym') != future['symbol']
+            or str(quote.get('token')) != str(future['token'])
+            or quote.get('exch') != 'MCX'):
+        raise ValueError('Futures quote does not match the selected contract')
+    price = float(quote['lp'])
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError('Invalid futures price')
+    return price
 
 
 def check_trade(api, trade):
@@ -816,16 +841,11 @@ def run(api):
                         candle_end = datetime.fromisoformat(alert['time']) + timedelta(minutes=TIMEFRAME_MINUTES)
                         if candle_end.date() != now.date() or now - candle_end > timedelta(minutes=TIMEFRAME_MINUTES, seconds=120):
                             raise ValueError('Latest completed candle is stale; no entry')
-                        quote = api.get_quotes(exchange='MCX', token=future['token'])
-                        if not quote or quote.get('stat') != 'Ok':
-                            raise ValueError('Futures quote unavailable')
-                        price = float(quote['lp'])
-                        if not math.isfinite(price) or price <= 0:
-                            raise ValueError('Invalid futures price')
+                        price = get_futures_price(api, future)
                         last_candle = alert['time']
                         saved_state['last_candle'] = last_candle
                         save_state(trade)
-                        print(f"{now:%H:%M} | WT1={alert['wt1']} | signal={alert['signal']}", flush=True)
+                        print(f"{now:%H:%M} | {future['symbol']}={price} | WT1={alert['wt1']} | signal={alert['signal']}", flush=True)
                         trade = handle_alert(api, alert, price, trade)
             save_state(trade)
             last_error = None
@@ -857,21 +877,18 @@ def check_connection(api):
     result = wt_cross(candles)
     if result is None:
         raise ValueError('Not enough valid completed candles for WaveTrend')
-    quote = api.get_quotes(exchange='MCX', token=future['token'])
-    if not quote or quote.get('stat') != 'Ok':
-        raise ValueError('Futures quote unavailable')
-    price = float(quote['lp'])
-    call = find_itm_option(api, 'LONG', price)
-    put = find_itm_option(api, 'SHORT', price)
+    price = get_futures_price(api, future)
+    call = find_atm_option(api, 'LONG', price)
+    put = find_atm_option(api, 'SHORT', price)
     print(json.dumps({
         'read_only': True,
         'timeframe': TIMEFRAME_MINUTES,
         'candles': len(candles),
         'latest_completed': result,
         'futures_price': price,
-        'itm_call': call,
-        'itm_put': put,
+        'atm_call': call,
+        'atm_put': put,
     }, indent=2), flush=True)
     if call is None or put is None:
-        raise ValueError('ITM option selection failed')
+        raise ValueError('ATM option selection failed')
     print('Check finished. No orders placed or canceled; trade state unchanged.', flush=True)

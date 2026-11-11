@@ -3,9 +3,6 @@ import argparse
 """Login once and retain an in-memory API session for 2028 strategies."""
 from credentials import USER_ID, PASSWORD, TOTP_SECRET, APP_KEY
 
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
 TELEGRAM = True
 last_notifications = {}
 
@@ -40,8 +37,6 @@ def send_telegram_message(msg, imp=True, category="error"):
                 msg = msg.replace(str(secret), '[REDACTED]')
         if not notification_allowed(msg, category):
             return True
-        stamp = datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%d-%m %H:%M:%S IST')
-        msg = f'{stamp}\n{msg}'
         response = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                                  data={'chat_id': CHANNEL_ID_IMP if imp else CHANNEL_ID,
                                        'text': msg[:4000]}, timeout=10)

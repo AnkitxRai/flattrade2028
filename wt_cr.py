@@ -17,8 +17,8 @@ SIGNAL_LENGTH = 4
 SIGNAL_MODE = 'wt1'  # WT1 crossing zero; 'difference' uses WT1 - WT2.
 START_TIME = clock_time(9, 30)
 END_TIME = clock_time(23, 0)
-LOTS = 1
-SL_POINTS = 50.0  # Distance below the option's buy price.
+LOTS = 3
+SL_POINTS = 25.0  # Distance below the option's buy price.
 SL_BUFFER = 5.0  # Sell limit below the SL trigger.
 last_trade_alert = None
 saved_state = {}
@@ -229,49 +229,7 @@ def find_atm_option(api, signal, price):
             print('Use LONG or SHORT and a valid futures price')
             return None
 
-        today = datetime.now(ZoneInfo('Asia/Kolkata')).date()
-        response = api.searchscrip(exchange='MCX', searchtext='CRUDEOILM')
-        if not response or response.get('stat') != 'Ok':
-            print('Option search failed')
-            return None
-
-        # Read the expiry, call/put type and strike from each symbol.
-        options = []
-        for row in response.get('values', []):
-            symbol = row.get('tsym', '')
-            match = re.fullmatch(r'CRUDEOILM(\d{2}[A-Z]{3}\d{2})([CP])(\d+(?:\.\d+)?)', symbol)
-            if not match:
-                continue
-
-            expiry = datetime.strptime(match[1], '%d%b%y').date()
-            if expiry < today:
-                continue
-
-            options.append({
-                'symbol': symbol,
-                'token': str(row['token']),
-                'expiry': expiry,
-                'kind': match[2],
-                'strike': float(match[3]),
-            })
-
-        if not options:
-            print('No CRUDEOILM options found')
-            return None
-
-        # Use next month's expiry when 2 calendar days or fewer remain.
-        expiries = sorted({option['expiry'] for option in options})
-        expiry = expiries[0]
-        if (expiry - today).days <= EXPIRY_ROLLOVER_DAYS:
-            next_month = (expiry.replace(day=28) + timedelta(days=4)).replace(day=1)
-            expiry = None
-            for date in expiries:
-                if date.year == next_month.year and date.month == next_month.month:
-                    expiry = date
-                    break
-            if expiry is None:
-                print('Next-month options unavailable')
-                return None
+        expiry = find_option_expiry(api)
 
         # A broad search can omit nearby strikes. Search the exact ATM symbol
         # instead of choosing a distant contract from an incomplete result list.
@@ -683,41 +641,60 @@ def day_end_exit(api, trade, now=None):
     return trade
 
 
+def search_contracts(api, month=None):
+    """Broad searches return only 25 rows; narrow by month, then verify the year."""
+    # Flattrade accepts "CRUDEOILM DEC"; "CRUDEOILM DEC26" returns no rows.
+    query = 'CRUDEOILM' if month is None else f"CRUDEOILM {month.strftime('%b').upper()}"
+    response = api.searchscrip(exchange='MCX', searchtext=query)
+    if not isinstance(response, dict) or response.get('stat') != 'Ok':
+        raise ValueError(f'{query} contract search failed')
+    if not isinstance(response.get('values'), list):
+        raise ValueError(f'{query} contract list unavailable')
+
+    contracts = []
+    for row in response['values']:
+        symbol = row.get('tsym', '')
+        match = re.fullmatch(r'CRUDEOILM(\d{2}[A-Z]{3}\d{2})([CP]\d+(?:\.\d+)?|F)?', symbol)
+        if not match or row.get('exch', 'MCX') != 'MCX' or not row.get('token'):
+            continue
+        expiry = datetime.strptime(match[1], '%d%b%y').date()
+        if month is None or (expiry.year, expiry.month) == (month.year, month.month):
+            contracts.append({'expiry': expiry, 'symbol': symbol,
+                              'token': str(row['token']), 'kind': match[2] or 'F'})
+    return contracts
+
+
+def find_option_expiry(api):
+    """Use the nearest monthly option, rolling with two calendar days left."""
+    today = datetime.now(ZoneInfo('Asia/Kolkata')).date()
+    contracts = search_contracts(api)
+    expiries = sorted({row['expiry'] for row in contracts
+                       if row['kind'].startswith(('C', 'P')) and row['expiry'] >= today})
+    if not expiries:
+        raise ValueError('No unexpired CRUDEOILM options found')
+    expiry = expiries[0]
+    if (expiry - today).days > EXPIRY_ROLLOVER_DAYS:
+        return expiry
+
+    # Search next month explicitly; it may be absent from the broad result.
+    next_month = (expiry.replace(day=28) + timedelta(days=4)).replace(day=1)
+    contracts = search_contracts(api, next_month)
+    expiries = sorted({row['expiry'] for row in contracts
+                       if row['kind'].startswith(('C', 'P')) and row['expiry'] >= today})
+    if not expiries:
+        raise ValueError(f"No CRUDEOILM options found for {next_month:%b %Y}")
+    return expiries[0]
+
+
 def find_futures(api):
     """Find mini futures for the month of the option expiry we will trade."""
-    today = datetime.now(ZoneInfo('Asia/Kolkata')).date()
-    response = api.searchscrip(exchange='MCX', searchtext='CRUDEOILM')
-    if not response or response.get('stat') != 'Ok':
-        raise ValueError('CRUDEOILM search failed')
-
-    expiries = set()
-    futures = []
-    for row in response.get('values', []):
-        symbol = row.get('tsym', '')
-        option = re.fullmatch(r'CRUDEOILM(\d{2}[A-Z]{3}\d{2})[CP]\d+(?:\.\d+)?', symbol)
-        future = re.fullmatch(r'CRUDEOILM(\d{2}[A-Z]{3}\d{2})(?:F)?', symbol)
-        if option:
-            expiry = datetime.strptime(option[1], '%d%b%y').date()
-            if expiry >= today:
-                expiries.add(expiry)
-        if future:
-            expiry = datetime.strptime(future[1], '%d%b%y').date()
-            if expiry >= today:
-                futures.append({'expiry': expiry, 'symbol': symbol, 'token': str(row['token'])})
-
-    if not expiries:
-        raise ValueError('No option expiry found')
-    expiry = min(expiries)
-    if (expiry - today).days <= EXPIRY_ROLLOVER_DAYS:
-        next_month = (expiry.replace(day=28) + timedelta(days=4)).replace(day=1)
-        later = sorted(d for d in expiries if d.year == next_month.year and d.month == next_month.month)
-        if not later:
-            raise ValueError('Next-month options unavailable')
-        expiry = later[0]
-    for future in sorted(futures, key=lambda item: item['expiry']):
-        if future['expiry'].year == expiry.year and future['expiry'].month == expiry.month:
-            return future
-    raise ValueError('Matching CRUDEOILM futures unavailable')
+    expiry = find_option_expiry(api)
+    contracts = search_contracts(api, expiry)
+    futures = [row for row in contracts if row['kind'] == 'F' and row['expiry'] >= expiry]
+    if not futures:
+        raise ValueError(f'Matching CRUDEOILM futures unavailable for {expiry:%b %Y}')
+    future = min(futures, key=lambda row: row['expiry'])
+    return {key: future[key] for key in ('expiry', 'symbol', 'token')}
 
 
 def get_futures_price(api, future):
